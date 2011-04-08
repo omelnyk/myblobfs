@@ -11,7 +11,7 @@ is a tool to mount MySQL tables as local directories for read-only access. Every
 uses MySQL C API for interaction with the database and is implemented on top of FUSE.
 .SH OPTIONS
 .TP
-.B "--username"
+.B "--user"
 MySQL username to be used when connecting to server
 .TP
 .B "-p"
