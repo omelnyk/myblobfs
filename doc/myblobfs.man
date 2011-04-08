@@ -1,0 +1,17 @@
+.TH "myblobfs" 1
+.SH NAME
+myblobfs \- mount a MySQL table as a local directory
+.SH SYNOPSIS
+.B myblobfs [options] path
+.SH DESCRIPTION
+.B myblobfs
+is a tool to mount MySQL tables as local directories for read-only access. Every row in the table is represented by a file. File name and contents are determined as values of columns, which are specified using options.
+.PP
+.B myblobfs
+uses MySQL C API for interaction with the database and is implemented on top of FUSE.
+.SH OPTIONS
+.TP
+.B "-h/--help"
+Print help options
+.TP
+.B \
