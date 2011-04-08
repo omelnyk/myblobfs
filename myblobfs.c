@@ -184,7 +184,7 @@ static int my_getattr(const char *path, struct stat *stbuf)
     memset(stbuf, 0, sizeof(struct stat));
 
     //
-    // Path points to the only directory, return its attributes
+    // Path points to the only directory, use its static attributes
     //
 
     if (strcmp(path, "/") == 0)
@@ -197,77 +197,90 @@ static int my_getattr(const char *path, struct stat *stbuf)
     }
 
     //
-    // Copy filename part from path
+    // Path points to one of the files, get its attributes from the database
     //
+
+    result = 0;
 
     filename = (char*) malloc(strlen(path) + 1);
-    if (filename == NULL)
+    if (filename != NULL)
     {
-        return -ENOENT;
-    }
+        strcpy(filename, path + 1);
 
-    strcpy(filename, path + 1);
+        //
+        // Query file size from the database
+        //
 
-    //
-    // Query file size from the database
-    //
+        my_data_field_size = (char*) malloc(strlen(size_fp) + strlen(my_data_field) + 1);
 
-    my_data_field_size = (char*) malloc(strlen(size_fp) + strlen(my_data_field) + 1);
+        if (my_data_field_size != NULL)
+        {
 
-    if (my_data_field_size == NULL)
-    {
+            sprintf(my_data_field_size, size_fp, my_data_field);
+
+            query = (char*) malloc(strlen(read_qp) + strlen(my_data_field_size) + 
+                    strlen(my_table) + strlen(my_name_field) + strlen(filename));
+
+            if (query != NULL)
+            {
+                sprintf(query, read_qp, my_data_field_size, my_table, my_name_field, filename);
+                mysql_real_query(&mysql, query, (unsigned int) strlen(query));
+                res = mysql_use_result(&mysql);
+
+                if (res != NULL)
+                {
+
+                    //
+                    // If specified filename has a corrsponding row in the
+                    // database, return its information. Else, report that
+                    // there is no such file
+                    //
+
+                    row = mysql_fetch_row(res);
+
+                    if (row != NULL)
+                    {
+                        stbuf->st_mode = S_IFREG | 0555;
+                        stbuf->st_nlink = 1;
+                        stbuf->st_size = atoi(row[0]);
+                        stbuf->st_uid = getuid();
+                        stbuf->st_gid = getgid();
+                    }
+                    else
+                    {
+                        result = -ENOENT;
+                    }
+ 
+                    mysql_free_result(res);
+                }
+                else
+                {
+                    result = -ENOENT;
+                }
+
+                free(query);
+             }
+            else
+            {   
+                result = -ENOENT;
+            }
+
+            free(my_data_field_size);
+        }
+        else
+        {
+            result = ENOENT;
+        }
+
         free(filename);
-        return;
-    }
-
-    sprintf(my_data_field_size, size_fp, my_data_field);
-
-    query = (char*) malloc(strlen(read_qp) + strlen(my_data_field_size) + strlen(my_table) +
-            strlen(my_name_field) + strlen(filename));
-
-    if (query == NULL)
-    {
-        free(my_data_field_size);        
-        free(filename);
-        return;
-    }
-
-    sprintf(query, read_qp, my_data_field_size, my_table, my_name_field, filename);
-    mysql_real_query(&mysql, query, (unsigned int) strlen(query));
-    res = mysql_use_result(&mysql);
-
-    free(query);
-    free(my_data_field_size);
-    free(filename);    
-
-    if (res == NULL)
-    {
-        return -ENOENT;
-    }
-
-    //
-    // Return file size
-    //
-
-    row = mysql_fetch_row(res);
-
-    if (row == NULL)
-    {
-        result = -ENOENT;
     }
     else
     {
-        stbuf->st_mode = S_IFREG | 0555;
-        stbuf->st_nlink = 1;
-        stbuf->st_size = atoi(row[0]);
-        stbuf->st_uid = getuid();
-        stbuf->st_gid = getgid();
-        result = 0;
+        result = -ENOENT;
     }
 
-    mysql_free_result(res);
-
     return result;
+
 }
 
 /**
