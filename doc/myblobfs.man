@@ -5,13 +5,39 @@ myblobfs \- mount a MySQL table as a local directory
 .B myblobfs [options] path
 .SH DESCRIPTION
 .B myblobfs
-is a tool to mount MySQL tables as local directories for read-only access. Every row in the table is represented by a file. File name and contents are determined as values of columns, which are specified using options.
+is a tool to mount MySQL tables as local directories for read-only access. Every row in the table is represented by a file. One column is reponsible for filename and another for its content.
 .PP
 .B myblobfs
 uses MySQL C API for interaction with the database and is implemented on top of FUSE.
 .SH OPTIONS
 .TP
-.B "-h/--help"
-Print help options
+.B "--username"
+MySQL username to be used when connecting to server
 .TP
-.B \
+.B "-p"
+Prompt for MySQL password
+.TP
+.B "--database"
+MySQL database name
+.TP
+.B "--table"
+Name of the table from which files should be fetched
+.TP
+.B "--name-field"
+Name of the integer column that contains file name
+.TP
+.B "--data-field"
+Name of the column with file content
+.TP
+.B "--host"
+MySQL server host name
+.TP
+.B "--port"
+MySQL server TCP/IP port number
+.TP
+.SH AUTHORS
+Olexandr Melnyk <me@omelnyk.net> is the author and maintainer of MyBlobFS.
+.SH WWW
+http://omelnyk.net/
+.SH "SEE ALSO"
+.BR mount (8)
