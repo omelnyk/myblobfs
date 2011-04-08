@@ -32,21 +32,6 @@
 #include <mysql/mysql.h>
 
 /**
- * Maximum length of a SQL query
- */
-#define MAX_QUERY_LENGTH 1024
-
-/**
- * Maximum length of the filename
- */
-#define MAX_FILENAME_LENGTH 16
-
-/**
- * Maximum size of file
- */
-#define MAX_FILE_SIZE 10486750
-
-/**
  * Macro for short options definition
  */
 #define MYBLOBFS_OPT_KEY(t, p, v) { t, offsetof(struct options, p), v }
@@ -56,13 +41,44 @@
  */
 struct options
 {
+	/**
+	 * Hostname of MySQL server
+	 */
     char *hostname;
+
+	/**
+	 * Remote port 
+	 */
     unsigned int port;
+
+	/**
+	 * Name of MySQL user
+	 */
     char *username;
+
+	/**
+	 * Whether to prompt user for password
+	 */
     int rq_password;
+
+	/**
+	 * Database name
+	 */
     char *database;
+
+	/**
+	 * Table name
+	 */
     char *table;
+
+	/**
+	 * Name of the field containing filenames
+	 */
     char *name_field;
+
+	/**
+	 * Name of the field with file contents
+	 */
     char *data_field;
 };
 
@@ -87,6 +103,12 @@ static char *my_data_field;
  * MySQL connection information
  */
 static MYSQL mysql;
+
+/**
+ * Query pattern for checking for table existance and verifying validness of
+ * name and data field types
+ */
+static char *verify_qp = "SELECT %s, %s FROM %s WHERE %s IS NULL";
 
 /**
  * Query pattern for fetching directory names
@@ -287,7 +309,7 @@ static int my_getattr(const char *path, struct stat *stbuf)
  * Returns list of name field values of all rows. Only path "/" is supported
  */
 static int my_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
-                      off_t offset, struct fuse_file_info *fi)
+    off_t offset, struct fuse_file_info *fi)
 {
     char *query;
     MYSQL_RES *res;
@@ -301,8 +323,8 @@ static int my_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
     filler(buf, ".", NULL, 0);
     filler(buf, "..", NULL, 0);
 
-    query = (char*) malloc(strlen(readdir_qp) + strlen(my_name_field) + strlen(my_table) +
-            strlen(my_name_field));
+    query = (char*) malloc(strlen(readdir_qp) + strlen(my_name_field) + 
+        strlen(my_table) + strlen(my_name_field));
 
     if (query == NULL)
     {
@@ -338,6 +360,10 @@ static int my_open(const char* path, struct fuse_file_info *fi)
     int result;
     MYSQL_RES *res;
     MYSQL_ROW row;
+
+	//
+	// Check for path validity and disallow write requests
+	//
 
     if (!is_valid_path(path))
     {
@@ -529,12 +555,12 @@ static struct fuse_operations my_oper =
  */
 static struct fuse_opt hello_opts[] =
 {
-    MYBLOBFS_OPT_KEY("--host=%s", hostname,    0),
-    MYBLOBFS_OPT_KEY("--port=%u", port,        0),
-    MYBLOBFS_OPT_KEY("--user=%s", username,    0),
-    MYBLOBFS_OPT_KEY("-p",    rq_password, 1),
-    MYBLOBFS_OPT_KEY("--database=%s", database,    0),
-    MYBLOBFS_OPT_KEY("--table=%s", table,       0),
+    MYBLOBFS_OPT_KEY("--host=%s",       hostname,    0),
+    MYBLOBFS_OPT_KEY("--port=%u",       port,        0),
+    MYBLOBFS_OPT_KEY("--user=%s",       username,    0),
+    MYBLOBFS_OPT_KEY("-p",              rq_password, 1),
+    MYBLOBFS_OPT_KEY("--database=%s",   database,    0),
+    MYBLOBFS_OPT_KEY("--table=%s",      table,       0),
     MYBLOBFS_OPT_KEY("--name-field=%s", name_field,  0),
     MYBLOBFS_OPT_KEY("--data-field=%s", data_field,  0),
 
@@ -590,20 +616,27 @@ int main(int argc, char *argv[])
         strcpy(password, pwd);
     }
 
-
     //
     // Try to connect to MySQL database
     //
 
+	//
+	// TODO: Password should be freed even in case of MySQL error
+	//
+
     mysql_init(&mysql);
     if (mysql_real_connect(&mysql, opts.hostname, opts.username, password, 
-                            opts.database, opts.port, NULL, 0) == NULL)
+         opts.database, opts.port, NULL, 0) == NULL)
     {
         puts(mysql_error(&mysql));
         return 0;
     }
 
     free(password);
+
+	//
+	// TODO: Verify field names validity
+	//
 
     //
     // Copy table and field names to global variables
@@ -635,6 +668,14 @@ int main(int argc, char *argv[])
     }
 
     strcpy(my_data_field, opts.data_field);
+
+	//
+	// TODO: Verify that table exists and can be queried
+	//
+
+	//
+	// TODO: Verify that name field is of allowed data type
+	//
 
     //
     // Give control to FUSE library
