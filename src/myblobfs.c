@@ -1,8 +1,9 @@
 /**
- * MyBlobFS - virtual file system driver for mounting of table rows as local files
+ * MyBlobFS - virtual user-space file system driver for mounting MySQL table
+ *   rows as local files for read-only access
  *
- * Copyright (C) 2001-2005  Miklos Szeredi <miklos@szeredi.hu>
- * Copyright (C) 2008 Olexandr Melnyk <me@omelnyk.net>
+ * Portions Copyright (C) 2001-2005  Miklos Szeredi <miklos@szeredi.hu>
+ * Copyright (C) 2008, 2009 Olexandr Melnyk <me@omelnyk.net>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -32,7 +33,7 @@
 #include <mysql/mysql.h>
 
 /**
- * Macro for short options definition
+ * Macro for short command-line options definition
  */
 #define MYBLOBFS_OPT_KEY(t, p, v) { t, offsetof(struct options, p), v }
 
@@ -72,14 +73,31 @@ struct options
     char *table;
 
 	/**
-	 * Name of the field containing filenames
+	 * Name of the field containing filename
 	 */
     char *name_field;
 
 	/**
-	 * Name of the field with file contents
+	 * Name of the field with file content
 	 */
     char *data_field;
+};
+
+/**
+ * Custom command-line options
+ */
+static struct fuse_opt hello_opts[] =
+{
+    MYBLOBFS_OPT_KEY("--host=%s",       hostname,    0),
+    MYBLOBFS_OPT_KEY("--port=%u",       port,        0),
+    MYBLOBFS_OPT_KEY("--user=%s",       username,    0),
+    MYBLOBFS_OPT_KEY("-p",              rq_password, 1),
+    MYBLOBFS_OPT_KEY("--database=%s",   database,    0),
+    MYBLOBFS_OPT_KEY("--table=%s",      table,       0),
+    MYBLOBFS_OPT_KEY("--name-field=%s", name_field,  0),
+    MYBLOBFS_OPT_KEY("--data-field=%s", data_field,  0),
+
+    FUSE_OPT_END
 };
 
 /**
@@ -88,7 +106,7 @@ struct options
 static char *my_table;
 
 /**
- * Name of the field containing filenames. Field must be declared as either:      
+ * Name of the field containing filename. Field must be declared as either: 
  * an integer or a string
  */
 static char *my_name_field;
@@ -105,13 +123,7 @@ static char *my_data_field;
 static MYSQL mysql;
 
 /**
- * Query pattern for checking for table existance and verifying validness of
- * name and data field types
- */
-static char *verify_qp = "SELECT %s, %s FROM %s WHERE %s IS NULL";
-
-/**
- * Query pattern for fetching directory names
+ * Query pattern for fetching file names
  */
 static char *readdir_qp = "SELECT %s FROM %s ORDER BY %s";
 
@@ -121,16 +133,21 @@ static char *readdir_qp = "SELECT %s FROM %s ORDER BY %s";
 static char *read_qp = "SELECT %s FROM %s WHERE %s = %s";
 
 /**
- * Function call pattern that returns value length
+ * Function call pattern that returns file size
  */
 static char *size_fp = "LENGTH(%s)";
 
 /**
- * Returns if str consists only of decimal digits
+ * Returns if str consists only of one or more decimal digits
  */
 my_bool is_uint(const char *str)
 {
     int i;
+
+	if (strlen(str) == 0)
+	{
+		return 0;
+	}
 
     for (i = 0; i < strlen(str); i++)
     {
@@ -145,15 +162,20 @@ my_bool is_uint(const char *str)
 
 /**
  * Returns if str is a valid MySQL identifier, which can be used without
- * hyphens
+ * being enclosed in hyphens
  */
 my_bool is_valid_ident(const char *str)
 {
     int i;
 
+	if (strlen(str) == 0)
+	{
+		return 0;
+	}
+
     for (i = 0; i < strlen(str); i++)
     {
-        if (!isalnum(str[i]) || (str[i] != '_'))
+        if (!isalnum(str[i]) && (str[i] != '_'))
         {
             return 0;
         }
@@ -163,7 +185,9 @@ my_bool is_valid_ident(const char *str)
 }
 
 /**
- * Returns is path is a valid file or directory path
+ * Returns if path is a valid relative file or directory path. Valid paths
+ * are: "/" (file system root directory) and "/id" (file representing record
+ * with primary key "id", where "id" is an unsigned integer value)
  */
 my_bool is_valid_path(const char *path)
 {
@@ -186,10 +210,9 @@ my_bool is_valid_path(const char *path)
 }
 
 /**
- * Returns stat info about specified row. Both directory and files are
- * read-only. We don't verify that a particular file exists since it
- * would result in an extra query per file (resulting in a huge database
- * load when listing files in a directory)
+ * Returns stat info of the specified file
+ *
+ * TODO: For memory/connection errors use error code other than -ENOENT
  */
 static int my_getattr(const char *path, struct stat *stbuf)
 {
@@ -253,7 +276,7 @@ static int my_getattr(const char *path, struct stat *stbuf)
                 {
 
                     //
-                    // If specified filename has a corrsponding row in the
+                    // If specified filename has a corresponding row in the
                     // database, return its information. Else, report that
                     // there is no such file
                     //
@@ -306,7 +329,11 @@ static int my_getattr(const char *path, struct stat *stbuf)
 }
 
 /**
- * Returns list of name field values of all rows. Only path "/" is supported
+ * Returns list of all files in the specified directory. The only supported
+ * directory path is "/"
+ *
+ * TODO: If path is correct but points to a file, return -ENOTDIR instead of
+ *   -ENOENT
  */
 static int my_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
     off_t offset, struct fuse_file_info *fi)
@@ -314,40 +341,61 @@ static int my_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
     char *query;
     MYSQL_RES *res;
     MYSQL_ROW row;
+	int result;
+
+	//
+	// Make sure that the only directory ("/") was requested
+	//
 
     if (strcmp(path, "/") != 0)
     {
         return -ENOENT;
     }
 
+	//
+	// Add two virtual directories: "." and ".."
+	//
+
     filler(buf, ".", NULL, 0);
     filler(buf, "..", NULL, 0);
+
+	//
+	// Query list of files from the database
+	//
 
     query = (char*) malloc(strlen(readdir_qp) + strlen(my_name_field) + 
         strlen(my_table) + strlen(my_name_field));
 
-    if (query == NULL)
+    if (query != NULL)
+	{
+    	sprintf(query, readdir_qp, my_name_field, my_table, my_name_field);
+    	mysql_real_query(&mysql, query, (unsigned int) strlen(query));
+    	res = mysql_use_result(&mysql);
+
+    	if (res != NULL)
+		{
+	    	while (row = mysql_fetch_row(res))
+    		{
+    	    	filler(buf, row[0], NULL, 0);
+    		}
+
+	    	mysql_free_result(res);
+
+			result = 0;
+		}
+		else
+    	{
+        	result = -ENOENT;
+    	}
+
+		free(query);
+	}
+	else
     {
-        return -ENOENT;
+        result = -ENOMEM;
     }
 
-    sprintf(query, readdir_qp, my_name_field, my_table, my_name_field);
-    mysql_real_query(&mysql, query, (unsigned int) strlen(query));
-    res = mysql_use_result(&mysql);
-
-    if (res == NULL)
-    {
-        return -ENOENT;
-    }
-
-    while (row = mysql_fetch_row(res))
-    {
-        filler(buf, row[0], NULL, 0);
-    }
-
-    mysql_free_result(res);
-
-    return 0;
+    return result;
 } 
 
 /**
@@ -372,7 +420,7 @@ static int my_open(const char* path, struct fuse_file_info *fi)
 
     if (fi->flags & O_RDONLY == 0)
     {
-        return -ENOENT;
+        return -EROFS;
     }
 
     //
@@ -385,68 +433,72 @@ static int my_open(const char* path, struct fuse_file_info *fi)
     }
 
     //
-    // Copy filename part from path
-    //
-
-    filename = (char*) malloc(strlen(path) + 1);
-    if (filename == NULL)
-    {
-        return -ENOENT;
-    }
-
-    strcpy(filename, path + 1);
-
-    //
     // Query if file exists in the database
     //
 
-    query = (char*) malloc(strlen(read_qp) + 1 + strlen(my_table) +
+    filename = (char*) malloc(strlen(path) + 1);
+    if (filename != NULL)
+	{
+    	strcpy(filename, path + 1);
+
+	    query = (char*) malloc(strlen(read_qp) + 1 + strlen(my_table) +
             strlen(my_name_field) + strlen(filename));
 
-    if (query == NULL)
-    {
-        free(filename);
-        return -ENOENT;
+	    if (query != NULL)
+	    {
+		    sprintf(query, read_qp, "1", my_table, my_name_field, filename);
+		    mysql_real_query(&mysql, query, (unsigned int) strlen(query));
+		    res = mysql_use_result(&mysql);
+	
+		    if (res != NULL)
+			{
+	
+		    	//
+		    	// Return if file exists
+		    	//
+	
+		    	row = mysql_fetch_row(res);
+		
+		    	if (row == NULL)
+		    	{
+		    	    result = -ENOENT;
+		    	}
+		    	else
+		    	{
+		        	result = 0;
+		    	}
+
+		    	mysql_free_result(res);
+			}
+			else
+		    {
+		        result = -EAGAIN;
+		    }
+
+			free(query);	
+	    }
+		else
+		{
+			result = -ENOMEM;
+		}
+	
+		free(filename);
+	}
+	else
+	{
+        result = -ENOMEM;
     }
-
-    sprintf(query, read_qp, "1", my_table, my_name_field, filename);
-    mysql_real_query(&mysql, query, (unsigned int) strlen(query));
-    res = mysql_use_result(&mysql);
-
-    free(query);
-    free(filename);    
-
-    if (res == NULL)
-    {
-        return -ENOENT;
-    }
-
-    //
-    // Return if file exists
-    //
-
-    row = mysql_fetch_row(res);
-
-    if (row == NULL)
-    {
-        result = -ENOENT;
-    }
-    else
-    {
-        result = 0;
-    }
-
-    mysql_free_result(res);
 
     return result;
 }
 
 /**
- * Returns size bytes from the data field value of record identified by path,
- * starting from byte offset
+ * Returns size bytes from the file identified by path, starting from byte offset 
+ *
+ * TODO: chop the desired block of data using SQL, rather than on the client side
  */
 static int my_read(const char *path, char *buf, size_t size, off_t offset,
-                   struct fuse_file_info *fi)
+  struct fuse_file_info *fi)
 {
     char *query, *filename;
     unsigned long *lengths, len;
@@ -464,77 +516,78 @@ static int my_read(const char *path, char *buf, size_t size, off_t offset,
 
     if (strcmp(path, "/") == 0)
     {
-        return -ENOENT;
+        return -EISDIR;
     }
 
     //
-    // Copy filename part from path
-    //
+    // Query file content from the database
+   	//
 
-    filename = (char*) malloc(strlen(path) + 1);
-    if (filename == NULL)
-    {
-        return -ENOENT;
+    filename = (char*) malloc(strlen(path));
+    if (filename != NULL)
+	{
+    	strcpy(filename, path + 1);
+
+    	query = (char*) malloc(strlen(read_qp) + strlen(my_data_field) +
+    	   strlen(my_table) + strlen(my_name_field) + strlen(filename) + 1);
+
+    	if (query != NULL)
+		{
+    		sprintf(query, read_qp, my_data_field, my_table, my_name_field, filename);
+    		mysql_real_query(&mysql, query, (unsigned int) strlen(query));
+    		res = mysql_use_result(&mysql);
+
+    		if (res != NULL)
+			{
+    			//
+    			// Copy part of the file, specified by offset and size
+    			//
+
+    			row = mysql_fetch_row(res);
+    			if (row != NULL)
+    			{
+       		 		lengths = mysql_fetch_lengths(res);
+        			len = lengths[0];
+
+		        	if (offset <= len)
+    		    	{
+    		        	if (offset + size > len)
+    		        	{
+    		            	size = len - offset;
+    		        	}
+	
+    		        	memcpy(buf, row[0] + offset, size);
+    		    	}
+    		    	else
+    		    	{
+    		        	size = 0;
+    		    	}    
+    			}
+    			else
+    			{
+    		    	size = -ENOENT;
+    			}
+		
+		    	mysql_free_result(res);
+			}
+			else
+			{
+				size = -ENOMEM;
+			}
+			
+			free(query);
+		}
+		else
+    	{
+    	    size = -ENOMEM;
+    	}
+	
+    	free(filename);
+	}
+	else
+	{
+        size = -ENOMEM;
     }
-
-    strcpy(filename, path + 1);
-
-    //
-    // Query file contents from the database
-    //
-
-    query = (char*) malloc(strlen(read_qp) + strlen(my_data_field) + strlen(my_table) +
-            strlen(my_name_field) + strlen(filename));
-
-    if (query == NULL)
-    {
-        free(filename);
-        return -ENOENT;
-    }
-
-    sprintf(query, read_qp, my_data_field, my_table, my_name_field, filename);
-    mysql_real_query(&mysql, query, (unsigned int) strlen(query));
-    res = mysql_use_result(&mysql);
-
-    free(query);
-    free(filename);    
-
-    if (res == NULL)
-    {
-        return -ENOENT;
-    }
-
-    //
-    // Copy part of the file, specified by offset and size
-    //
-
-    row = mysql_fetch_row(res);
-    if (row != NULL)
-    {
-        lengths = mysql_fetch_lengths(res);
-        len = lengths[0];
-
-        if (offset <= len)
-        {
-            if (offset + size > len)
-            {
-                size = len - offset;
-            }
-
-            memcpy(buf, row[0] + offset, size);
-        }
-        else
-        {
-            size = 0;
-        }    
-    }
-    else
-    {
-
-        size = -ENOENT;
-    }
-
-    mysql_free_result(res);
 
     return size;
 }
@@ -551,32 +604,17 @@ static struct fuse_operations my_oper =
 };
 
 /**
- * Custom command-line options to be parsed
- */
-static struct fuse_opt hello_opts[] =
-{
-    MYBLOBFS_OPT_KEY("--host=%s",       hostname,    0),
-    MYBLOBFS_OPT_KEY("--port=%u",       port,        0),
-    MYBLOBFS_OPT_KEY("--user=%s",       username,    0),
-    MYBLOBFS_OPT_KEY("-p",              rq_password, 1),
-    MYBLOBFS_OPT_KEY("--database=%s",   database,    0),
-    MYBLOBFS_OPT_KEY("--table=%s",      table,       0),
-    MYBLOBFS_OPT_KEY("--name-field=%s", name_field,  0),
-    MYBLOBFS_OPT_KEY("--data-field=%s", data_field,  0),
-
-    FUSE_OPT_END
-};
-
-/**
  * Program entry point
+ *
+ * TODO: Make sure that all memory is always free()'d
  */
 int main(int argc, char *argv[])
 {
     struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
     struct options opts;
-    char *pwd, *password;
-    int ret;
-    
+    char *password = NULL;
+    int ret, res, error;
+
     //
     // Parse command-line options
     //
@@ -588,109 +626,154 @@ int main(int argc, char *argv[])
         return 0;
     }
 
-    if (opts.port == 0)
+    if (opts.database != NULL)
     {
-        opts.port =  3306;
-    }
-
-    //
-    // Read password from command-line, if -p flag was specifed
-    //
-
-    if (opts.rq_password)
-    {
-        pwd = getpass("Enter password: ");
-        if (pwd == NULL)
+        if (opts.table != NULL)
         {
-            puts("Out of memory");
-            return 0;
-        }
+            if (opts.name_field != NULL)
+            {
+                if (opts.data_field != NULL)
+                {
+                   	my_table = (char*) malloc(strlen(opts.table) + 1);
+                	if (my_table != NULL)
+                	{
+                   		my_name_field = (char*) malloc(strlen(opts.name_field) + 1);
+                		if (my_name_field != NULL)
+                		{
+                		    my_data_field = (char*) malloc(strlen(opts.data_field) + 1);
+                			if (my_data_field != NULL)
+                			{
+                   				if (opts.port == 0)
+                   				{
+                       				opts.port = 3306; // FIXME
+                   				}
 
-        password = (char*) malloc(strlen(pwd) + 1);
-        if (password == NULL)
+                	    		//
+                   				// Read password from command line, if -p flag was specifed
+                   				//
+
+                		    	if (opts.rq_password)
+                   				{
+                   					password = getpass("Enter password: ");
+                   				}
+
+                       			if (!opts.rq_password || password != NULL)
+                       			{
+                    				//
+                    				// Copy command-line option values to global variables
+                    				//
+
+                    				strcpy(my_table, opts.table);
+                    				strcpy(my_name_field, opts.name_field);
+                    				strcpy(my_data_field, opts.data_field);
+ 
+                   					//
+                    				// Try to connect to MySQL database
+                    				//
+
+                					//
+                					// TODO: Password should be freed even in case of MySQL error
+                					//
+
+                			    	mysql_init(&mysql);
+                					if (mysql_real_connect(&mysql, opts.hostname, 
+                					  opts.username, password, opts.database, opts.port,
+                					  NULL, 0) != NULL)
+                    				{
+                						if (!is_valid_ident(my_table))
+                    					{
+                      						puts("Error: Illegal characters in table name identifier");
+                							error = 1;
+                    					}
+
+                						//
+                						// Verify table and field names validity
+                						//
+
+                						error = 0;
+	
+                						if (!is_valid_ident(my_table))
+                    					{
+                      						puts("Error: Illegal characters in table name identifier");
+                							error = 1;
+                    					}
+
+                						if (!is_valid_ident(my_name_field))
+                    					{
+                      						puts("Error: Illegal characters in ""name"" field identifier");
+                							error = 1;
+                    					}
+
+                						if (!is_valid_ident(my_data_field))
+                    					{
+                      						puts("Error: Illegal characters in ""data"" field identifier");
+                							error = 1;
+                    					}
+
+                						if (!error)
+                						{
+                							//
+                							// Give control to FUSE library
+                							//
+
+                   							ret = fuse_main(args.argc, args.argv, &my_oper);
+                    						if (ret)
+                       						{
+                        						puts("");
+                    						}
+                						}
+                                    }
+                					else
+                					{
+                	        			puts(mysql_error(&mysql));
+                					}
+
+                                    if (password != NULL)
+                                    {
+                					    free(password);
+                                    }
+                    			}
+
+                				free(my_data_field);
+                			}
+                			else
+                			{
+                      			puts("Out of memory");
+                			}
+
+                			free(my_name_field);
+                		}
+                    	else
+                    	{
+                      		puts("Out of memory");
+                    	}
+
+                		free(my_table);
+                	}
+                    else
+                    {
+                      	puts("Out of memory");
+                    }
+                }
+                else
+                {
+                    puts("Name field must be specified");
+                }
+            }
+            else
+            {
+                puts("Date field must be specified");
+            }
+        }
+        else
         {
-            puts("Out of memory");
-            return 0;
+            puts("Table name must be specified");
         }
-
-        strcpy(password, pwd);
     }
-
-    //
-    // Try to connect to MySQL database
-    //
-
-	//
-	// TODO: Password should be freed even in case of MySQL error
-	//
-
-    mysql_init(&mysql);
-    if (mysql_real_connect(&mysql, opts.hostname, opts.username, password, 
-         opts.database, opts.port, NULL, 0) == NULL)
+    else
     {
-        puts(mysql_error(&mysql));
-        return 0;
+        puts("Database name must be specified");
     }
-
-    free(password);
-
-	//
-	// TODO: Verify field names validity
-	//
-
-    //
-    // Copy table and field names to global variables
-    //
-
-    my_table = (char*) malloc(strlen(opts.table) + 1);
-    if (my_table == NULL)
-    {
-        puts("Out of memory");
-        return 0;
-    }
-
-    strcpy(my_table, opts.table);
-
-    my_name_field = (char*) malloc(strlen(opts.name_field) + 1);
-    if (my_name_field == NULL)
-    {
-        puts("Out of memory");
-        return 0;
-    }
-
-    strcpy(my_name_field, opts.name_field);
-
-    my_data_field = (char*) malloc(strlen(opts.data_field) + 1);
-    if (my_data_field == NULL)
-    {
-        puts("Out of memory");
-        return 0;
-    }
-
-    strcpy(my_data_field, opts.data_field);
-
-	//
-	// TODO: Verify that table exists and can be queried
-	//
-
-	//
-	// TODO: Verify that name field is of allowed data type
-	//
-
-    //
-    // Give control to FUSE library
-    //
-
-    ret = fuse_main(args.argc, args.argv, &my_oper);
-
-    if (ret)
-    {
-        puts("");
-    }
-
-    free(my_data_field);
-    free(my_name_field);
-    free(my_table);
 
     fuse_opt_free_args(&args);
 
